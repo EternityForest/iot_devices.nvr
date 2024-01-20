@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='NVRChannel',
-    version='0.1.1',
+    version='0.1.2',
     author="Daniel Dunn",
     author_email="dannydunn@eternityforest.com",
     packages=['NVRChannel',"NVRChannel.NVRChannel"],
@@ -16,5 +16,6 @@ setup(
     	"Pillow",
     	"tflite-runtime",
         "scullery",
+        "zeep"
     ]
 )

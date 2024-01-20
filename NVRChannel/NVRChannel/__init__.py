@@ -1,6 +1,4 @@
-from multiprocessing import RLock
-from mako.lookup import TemplateLookup
-from scullery import iceflow, workers
+from __future__ import annotations
 import os
 import time
 import threading
@@ -10,47 +8,60 @@ import traceback
 import shutil
 import re
 import io
+import socket
 import random
+from typing import Optional
+from datetime import datetime
+from datetime import timezone
+from zeroconf import ServiceBrowser, ServiceStateChange
+import numpy as np
+import iot_devices.device as devices
+from scullery import iceflow, workers
+import tflite_runtime.interpreter as tflite
+import cv2
+import PIL.Image
+import PIL.ImageOps
+import PIL.ImageFilter
+from NVRChannel.onvif import ONVIFCamera
+
 
 logger = logging.Logger("plugins.nvr")
 
-templateGetter = TemplateLookup(os.path.dirname(__file__))
-from datetime import datetime
-from datetime import timezone
+
+path = os.path.dirname(os.path.abspath(__file__))
 
 
-path = os.path.dirname( os.path.abspath(__file__))
-
-
-def getRTSPFromOnvif(c):
+def get_rtsp_from_onvif(c: ONVIFCamera):
+    "Choose a URI to read from the discovered camera"
     c.create_devicemgmt_service()
     c.create_media_service()
 
     selection = None
     cw = 0
     for p in c.media.GetProfiles():
-
         # We want to find a profile that has H264/AAC
-        if not 'VideoEncoderConfiguration' in p:
+        if 'VideoEncoderConfiguration' not in p:
             continue
-        if not 'Encoding' in p['VideoEncoderConfiguration']:
+        if 'Encoding' not in p['VideoEncoderConfiguration']:
             continue
-        
-        if not p['VideoEncoderConfiguration']['Encoding']=='H264':
+
+        if not p['VideoEncoderConfiguration']['Encoding'] == 'H264':
             continue
 
         if 'AudioEncoderConfiguration' in p:
-            if not p['AudioEncoderConfiguration']['Encoding']=="AAC":
+            if not p['AudioEncoderConfiguration']['Encoding'] == "AAC":
                 continue
-
 
         # We want the best available quality so we are going to look for the widest.
         if 'Resolution' in p['VideoEncoderConfiguration']:
-            if p['VideoEncoderConfiguration']['Resolution']['Width']< cw:
+            if p['VideoEncoderConfiguration']['Resolution']['Width'] < cw:
                 continue
 
             cw = p['VideoEncoderConfiguration']['Resolution']['Width']
         selection = p
+
+    if not selection:
+        raise RuntimeError('Could not select profile from discovered camera')
 
     # Only do the net request after we know what we want to connect with.
     resp = c.media.GetStreamUri({
@@ -61,13 +72,12 @@ def getRTSPFromOnvif(c):
     return resp.Uri
 
 
-
-objectDetector = [None, None]
+# Just easy mutable containers
+objectDetector: list[Optional[tflite.Interpreter]] = [None]
+tf_labels: list[Optional[np.ndarray]] = [None]
 
 # Only one of these should happpen at a time. Because we need to limit how much CPU it can burn.
 object_detection_lock = threading.RLock()
-
-import numpy
 
 
 def get_output_layers(net):
@@ -78,8 +88,8 @@ def get_output_layers(net):
 
 
 def toImgOpenCV(imgPIL):  # Conver imgPIL to imgOpenCV
-    i = numpy.array(imgPIL)  # After mapping from PIL to numpy : [R,G,B,A]
-    # numpy Image Channel system: [B,G,R,A]
+    i = np.array(imgPIL)  # After mapping from PIL to np : [R,G,B,A]
+    # np Image Channel system: [B,G,R,A]
     red = i[:, :, 0].copy()
     i[:, :, 0] = i[:, :, 2].copy()
     i[:, :, 2] = red
@@ -88,8 +98,6 @@ def toImgOpenCV(imgPIL):  # Conver imgPIL to imgOpenCV
 
 def letterbox_image(image, size):
     '''resize image with unchanged aspect ratio using padding'''
-    import cv2
-    import numpy as np
     iw, ih = image.shape[0:2][::-1]
     w, h = size
     scale = min(w / iw, h / ih)
@@ -109,39 +117,35 @@ def letterbox_image(image, size):
 
 # Label map: https://github.com/joonb14/TFLiteDetection
 
-def recognize_tflite(i, r):
-    import tflite_runtime.interpreter as tflite
-    import cv2
-    import PIL.Image
-    import PIL.ImageOps
-    import PIL.ImageFilter
+def recognize_tflite(i: bytes | bytearray, device: NVRChannel):
+
     invoke_time = time.time()
 
-    
-    i = PIL.Image.open(io.BytesIO(i))
-    pilimg = i
-    i = i.filter(PIL.ImageFilter.GaussianBlur(1))
-    i = PIL.ImageOps.autocontrast(i, cutoff=0.05)
+    pil_img = PIL.Image.open(io.BytesIO(i))
+    filtered = pil_img.filter(PIL.ImageFilter.GaussianBlur(1))
+    filtered = PIL.ImageOps.autocontrast(filtered, cutoff=5)
 
     if not objectDetector[0]:
-        objectDetector[0] = tflite.Interpreter(num_threads=4, model_path=os.path.join(
+        interpreter = tflite.Interpreter(num_threads=4, model_path=os.path.join(
             path, "efficientdet/efficientdet-lite0-f32.tflite"))
-        objectDetector[0].allocate_tensors()
+
+        interpreter.allocate_tensors()
+        objectDetector[0] = interpreter
 
     # Sigh.  So many breaking changes to watch for!
     # https://stackoverflow.com/questions/74379966/typeerror-text-reading-control-character-must-be-a-single-unicode-character-or
-    if objectDetector[1] is None:
+    if tf_labels[0] is None:
         try:
-            objectDetector[1] = numpy.loadtxt(os.path.join(
+            tf_labels[0] = np.loadtxt(os.path.join(
                 path, "labelmap.txt"), dtype=str, delimiter="/n")
         except Exception:
-            objectDetector[1] = numpy.genfromtxt(os.path.join(
+            tf_labels[0] = np.genfromtxt(os.path.join(
                 path, "labelmap.txt"), dtype=str, delimiter="/n")
 
     interpreter = objectDetector[0]
-    labels = objectDetector[1]
+    labels = tf_labels[0]
 
-    original_image = toImgOpenCV(i)
+    original_image = toImgOpenCV(filtered)
     # Get input and output tensors.
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
@@ -152,7 +156,7 @@ def recognize_tflite(i, r):
     image = letterbox_image(original_image, (tensor_w, tensor_h))
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    input_image = numpy.expand_dims(image, 0)
+    input_image = np.expand_dims(image, 0)
 
     interpreter.set_tensor(input_details[0]['index'], input_image)
     original_image_h = original_image.shape[0]
@@ -160,13 +164,13 @@ def recognize_tflite(i, r):
 
     interpreter.invoke()
     t = time.time() - invoke_time
-    r.lastInferenceTime = t
+    device.lastInferenceTime = t
 
     # The function `get_tensor()` returns a copy of the tensor data.
     # Use `tensor()` in order to get a pointer to the tensor.
 
     o = interpreter.get_tensor(output_details[0]['index'])[0]
-    probability = numpy.array([i[5]for i in o])
+    probability = np.array([i[5]for i in o])
 
     # Our dynamically chosen confidence threshhold meant to pick up things in dim light
     p = float(max(min(0.10, float(probability.max()) * 0.8), 0.01))
@@ -180,8 +184,8 @@ def recognize_tflite(i, r):
         if int(i[6]) < 1:
             continue
 
-        x, y, x2, y2 = (float((i[2] / tensor_w) * original_image_w), 
-                        float((i[1] / tensor_h) * original_image_h), 
+        x, y, x2, y2 = (float((i[2] / tensor_w) * original_image_w),
+                        float((i[1] / tensor_h) * original_image_h),
                         float((i[4] / tensor_w) * original_image_w),
                         float((i[3] / tensor_h) * original_image_h))
 
@@ -210,9 +214,9 @@ def recognize_tflite(i, r):
         # you probably would have a higher confidence
         if (x > 1 and y > 24) or confidence > 0.33:
 
-            # If something takes up a very large amount of the frame, we probably have a clear view of it.  
+            # If something takes up a very large amount of the frame, we probably have a clear view of it.
             # If we are still not confident the ANN
-            # Is probably making stuff up.  Very large things are going to be uncommon since most cameras like 
+            # Is probably making stuff up.  Very large things are going to be uncommon since most cameras like
             # this aren't doing extreme close ups
             # and the ones that are probably have good lighting
             if ((w < original_image_w / 4) or (confidence > 0.18)) and ((h < (original_image_h / 3)) or (confidence > 0.15)):
@@ -231,19 +235,15 @@ def recognize_tflite(i, r):
         else:
             pass  # print(v,"reject low xy")
 
-    return {'objects': retval, 'x-inferencetime': t, 'x-imagesize': [original_image_w,original_image_h]}
+    return {'objects': retval, 'x-inferencetime': t, 'x-imagesize': [original_image_w, original_image_h]}
 
 
 automated_record_uuid = '76241b9c-5b08-4828-9358-37c6a25dd823'
-
-from zeroconf import ServiceBrowser, ServiceStateChange
 
 
 # very much not thread safe, doesn't matter, it's only for one UI page
 httpservices = []
 httplock = threading.Lock()
-
-import socket
 
 
 onvifCams = {}
@@ -251,6 +251,7 @@ onvifCams = {}
 
 def fixAddr(a):
     return a.split(".")[0]+".local"
+
 
 def on_service_state_change(zeroconf, service_type, name, state_change):
     with httplock:
@@ -265,15 +266,15 @@ def on_service_state_change(zeroconf, service_type, name, state_change):
 
             try:
                 if name.startswith("AMC"):
-                    #No username/pw yet, we cannot actually fill this in.
-                    onvifCams[fixAddr(name)]= None
+                    # No username/pw yet, we cannot actually fill this in.
+                    onvifCams[fixAddr(name)] = None
             except Exception:
                 pass
-        else:
+        elif state_change is ServiceStateChange.Removed:
             try:
                 httpservices.remove((tuple(sorted(
                     [socket.inet_ntoa(i) for i in info.addresses])), service_type, name, info.port))
-                
+
                 if name.startswith("AMC"):
                     del onvifCams[fixAddr(name)]
             except Exception:
@@ -281,7 +282,7 @@ def on_service_state_change(zeroconf, service_type, name, state_change):
 
 
 # Not common enough to waste CPU all the time on
-#browser = ServiceBrowser(util.zeroconf, "_https._tcp.local.", handlers=[ on_service_state_change])
+# browser = ServiceBrowser(util.zeroconf, "_https._tcp.local.", handlers=[ on_service_state_change])
 try:
     from kaithem.src.util import zeroconf as zcinstance
 except Exception:
@@ -292,28 +293,25 @@ browser2 = ServiceBrowser(zcinstance, "_http._tcp.local.", handlers=[
                           on_service_state_change])
 
 
-mediaFolders = weakref.WeakValueDictionary()
-
-
 class Pipeline(iceflow.GstreamerPipeline):
 
-    def onMotionBegin(self, *a, **k):
+    def on_motion_begin(self, *a, **k):
         self.mcb(True)
 
-    def onMotionEnd(self, *a, **k):
+    def on_motion_end(self, *a, **k):
         self.mcb(False)
 
-    def onPresenceValue(self, v):
+    def on_presence_value(self, v):
         self.presenceval(v)
 
     def onVideoAnalyze(self, *a, **k):
         self.acb(*a)
 
-    def onBarcode(self, *a, **k):
+    def on_barcode(self, *a, **k):
         self.bcb(*a, **k)
 
-    def onAppsinkData(self, *a, **k):
-        self.dev.onAppsinkData(*a, **k)
+    def on_appsink_data(self, *a, **k):
+        self.dev.on_appsink_data(*a, **k)
 
     def getGstreamerSourceData(self, s, cfg, un, pw, doJackAudio=False):
         self.config = cfg
@@ -322,160 +320,175 @@ class Pipeline(iceflow.GstreamerPipeline):
 
         # The source is an HLS stream
         if s.endswith(".m3u8") and s.startswith("http"):
-            self.addElement("souphttpsrc", location=s)
-            self.addElement("hlsdemux")
-            self.addElement("tsdemux")
-            self.addElement("parsebin")
-            self.h264source = self.addElement("tee")
+            self.add_element("souphttpsrc", location=s)
+            self.add_element("hlsdemux")
+            self.add_element("tsdemux")
+            self.add_element("parsebin")
+            self.h264source = self.add_element("tee")
 
         elif s.startswith("file://"):
-            if not os.path.exists(s[len("file://"):]):
-                raise RuntimeError("Bad file: " + s)
-            self.addElement(
-                "multifilesrc", location=s[len("file://"):], loop=True)
-            if s.endswith(".mkv"):
-                dm = self.addElement("matroskademux")
+
+            if s.endswith(".jpg"):
+                self.add_element("multifilesrc", location=s.split("://")[-1], loop=True, caps="image/jpeg,framerate=" +
+                                 (self.config.get('device.fps', '1') or '1') + "/1", do_timestamp=True)
+                self.add_element("jpegdec")
+                self.add_element("videoconvert")
+                self.add_element("videorate")
+                self.add_element("queue", max_size_time=10000000)
+                self.add_element("x264enc", tune="zerolatency",
+                                 rc_lookahead=0, bitrate=int(self.dev.config['device.bitrate']),
+                                 key_int_max=int((self.config.get('device.fps', '4') or '4')) * 2)
+                self.add_element(
+                    "capsfilter", caps="video/x-h264, profile=main")
+                self.add_element("h264parse")
+                self.add_element("queue")
+
+                self.h264source = self.add_element("tee")
+
             else:
-                dm = self.addElement("qtdemux")
-            self.addElement(
-                "h264parse", connectWhenAvailable="video/x-h264")
-            # self.addElement('identity', sync=True)
-            self.syncFile = True
-            self.addElement('queue', max_size_time=10000000)
+                if not os.path.exists(s[len("file://"):]):
+                    raise RuntimeError("Bad file: " + s)
+                self.add_element(
+                    "multifilesrc", location=s[len("file://"):], loop=True)
+                if s.endswith(".mkv"):
+                    dm = self.add_element("matroskademux")
+                else:
+                    dm = self.add_element("qtdemux")
+                self.add_element(
+                    "h264parse", connectWhenAvailable="video/x-h264")
+                # self.add_element('identity', sync=True)
+                self.syncFile = True
+                self.add_element('queue', max_size_time=10000000)
 
-            self.h264source = self.addElement("tee")
-            self.addElement("decodebin3", connectToOutput=dm,
-                            connectWhenAvailable="audio")
-            self.addElement("audioconvert", connectWhenAvailable="audio")
+                self.h264source = self.add_element("tee")
+                self.add_element("decodebin3", connectToOutput=dm,
+                                 connectWhenAvailable="audio")
+                self.add_element("audioconvert", connectWhenAvailable="audio")
 
-            self.addElement("audiorate")
-            self.addElement("queue", max_size_time=10000000)
-            self.addElement("voaacenc")
-            self.addElement("aacparse")
+                self.add_element("audiorate")
+                self.add_element("queue", max_size_time=10000000)
+                self.add_element("voaacenc")
+                self.add_element("aacparse")
 
-            self.mp3src = self.addElement("queue", max_size_time=10000000)
+                self.mp3src = self.add_element("queue", max_size_time=10000000)
 
         # Make a video test src just for this purpose
         elif not s:
-            self.addElement("videotestsrc", is_live=True)
-            self.addElement("videorate")
-            self.addElement("capsfilter", caps="video/x-raw,framerate=" +
-                            (self.config.get('device.fps', '4') or '4') + "/1")
-            self.addElement(
+            self.add_element("videotestsrc", is_live=True)
+            self.add_element("videorate")
+            self.add_element("capsfilter", caps="video/x-raw,framerate=" +
+                             (self.config.get('device.fps', '4') or '4') + "/1")
+            self.add_element(
                 "capsfilter", caps="video/x-raw, format=I420, width=320, height=240")
 
-            self.addElement("videoconvert")
-            self.addElement("x264enc", tune="zerolatency",
-                            byte_stream=True, rc_lookahead=0)
-            self.addElement("h264parse")
-            self.h264source = self.addElement("tee")
+            self.add_element("videoconvert")
+            self.add_element("x264enc", tune="zerolatency",
+                             byte_stream=True, rc_lookahead=0)
+            self.add_element("h264parse")
+            self.h264source = self.add_element("tee")
 
         # Make a video test src just for this purpose
         elif s == "test":
-            self.addElement("videotestsrc", is_live=True)
-            self.addElement("capsfilter", caps="video/x-raw,framerate=" +
-                            (self.config.get('device.fps', '4') or '4') + "/1")
+            self.add_element("videotestsrc", is_live=True)
+            self.add_element("capsfilter", caps="video/x-raw,framerate=" +
+                             (self.config.get('device.fps', '4') or '4') + "/1")
 
-            self.addElement(
+            self.add_element(
                 "capsfilter", caps="video/x-raw, format=I420, width=320, height=240")
-            self.addElement("videoconvert")
-            self.addElement("x264enc", tune="zerolatency", key_int_max=int(
+            self.add_element("videoconvert")
+            self.add_element("x264enc", tune="zerolatency", key_int_max=int(
                 (self.config.get('device.fps', '4') or '4')) * 2)
-            self.addElement("h264parse")
-            self.h264source = self.addElement("tee")
+            self.add_element("h264parse")
+            self.h264source = self.add_element("tee")
 
         elif s == "webcam" or s == "webcam_audio":
-            self.addElement("v4l2src")
-            self.addElement("videorate", drop_only=True)
-            self.addElement("capsfilter", caps="video/x-raw,framerate=" +
-                            (self.config.get('device.fps', '4') or '4') + "/1")
-            self.addElement("videoconvert")
-            self.addElement("queue", max_size_time=10000000)
-            self.addElement("x264enc", tune="zerolatency",
-                                rc_lookahead=0, bitrate=int(self.dev.config['device.bitrate']), key_int_max=int((self.config.get('device.fps', '4') or '4')) * 2)
-            self.addElement(
+            self.add_element("v4l2src")
+            self.add_element("videorate", drop_only=True)
+            self.add_element("capsfilter", caps="video/x-raw,framerate=" +
+                             (self.config.get('device.fps', '4') or '4') + "/1")
+            self.add_element("videoconvert")
+            self.add_element("queue", max_size_time=10000000)
+            self.add_element("x264enc", tune="zerolatency",
+                             rc_lookahead=0, bitrate=int(self.dev.config['device.bitrate']), key_int_max=int((self.config.get('device.fps', '4') or '4')) * 2)
+            self.add_element(
                 "capsfilter", caps="video/x-h264, profile=main")
-            self.addElement("h264parse", config_interval=1)
-            self.h264source = self.addElement("tee")
+            self.add_element("h264parse", config_interval=1)
+            self.h264source = self.add_element("tee")
 
-            self.addElement("alsasrc", connectToOutput=False)
-            self.addElement("queue")
-            self.addElement("audioconvert")
+            self.add_element("alsasrc", connectToOutput=False)
+            self.add_element("queue")
+            self.add_element("audioconvert")
 
-            self.addElement("voaacenc")
-            self.addElement("aacparse")
+            self.add_element("voaacenc")
+            self.add_element("aacparse")
 
-            self.mp3src = self.addElement("queue", max_size_time=10000000)
+            self.mp3src = self.add_element("queue", max_size_time=10000000)
 
         elif s.startswith("rtsp://") or self.dev.onvif:
 
             if self.dev.onvif:
-                s = getRTSPFromOnvif(self.dev.onvif)
+                s = get_rtsp_from_onvif(self.dev.onvif)
                 self.dev.metadata['device.discovered_rtsp_url'] = s
 
-            rtsp = self.addElement(
+            rtsp = self.add_element(
                 "rtspsrc", location=s, latency=100, async_handling=True, user_id=un or None, user_pw=pw or None)
-            self.addElement("rtph264depay", connectWhenAvailable="video")
+            self.add_element("rtph264depay", connectWhenAvailable="video")
 
-            self.addElement("h264parse", config_interval=1)
+            self.add_element("h264parse", config_interval=1)
 
-            self.h264source = self.addElement("tee")
+            self.h264source = self.add_element("tee")
 
-            self.addElement("decodebin", connectToOutput=rtsp,
-                            connectWhenAvailable="audio", async_handling=True)
-
-            if doJackAudio:
-                rawaudiotee = self.addElement('tee',connectWhenAvailable="audio")
-
-            self.addElement("audioconvert")
-            self.addElement("audiorate")
-            self.addElement("voaacenc")
-            self.addElement("aacparse")
-
-            self.mp3src = self.addElement("queue", max_size_time=10000000)
+            self.add_element("decodebin", connectToOutput=rtsp,
+                             connectWhenAvailable="audio", async_handling=True)
 
             if doJackAudio:
-                self.addElement("queue",max_size_time=100_000_000,leaky=2, connectWhenAvailable="audio", connectToOutput=rawaudiotee)
-                self.sink = self.addElement("jackaudiosink", buffer_time=10, latency_time=10, sync=False, provide_clock=False,
-                                            slave_method=0, port_pattern="ghjkcsrc", client_name=self.dev.name + "_out", connect=0, blocksize=512)
+                rawaudiotee = self.add_element(
+                    'tee', connectWhenAvailable="audio")
 
+            self.add_element("audioconvert")
+            self.add_element("audiorate")
+            self.add_element("voaacenc")
+            self.add_element("aacparse")
+
+            self.mp3src = self.add_element("queue", max_size_time=10000000)
+
+            if doJackAudio:
+                self.add_element("queue", max_size_time=100_000_000, leaky=2,
+                                 connectWhenAvailable="audio", connectToOutput=rawaudiotee)
+                self.sink = self.add_element("jackaudiosink", buffer_time=10, latency_time=10, sync=False, provide_clock=False,
+                                             slave_method=0, port_pattern="ghjkcsrc", client_name=self.dev.name + "_out", connect=0, blocksize=512)
 
         elif s.startswith("srt://"):
-            rtsp = self.addElement(
+            rtsp = self.add_element(
                 "srtsrc", mode=1, uri=s, passphrase=pw or '')
 
-            demux = self.addElement('tsdemux')
-            self.addElement("h264parse", config_interval=2,
-                            connectWhenAvailable="video")
-            self.addElement("queue",max_size_time=100_000_000,leaky=2)
+            demux = self.add_element('tsdemux')
+            self.add_element("h264parse", config_interval=2,
+                             connectWhenAvailable="video")
+            self.add_element("queue", max_size_time=100_000_000, leaky=2)
 
-            self.h264source = self.addElement("tee")
+            self.h264source = self.add_element("tee")
 
-            self.addElement("aacparse", connectToOutput=demux,
-                            connectWhenAvailable="audio")
-            self.mp3src = self.addElement("queue", max_size_time=100_000_000,leaky=2)
+            self.add_element("aacparse", connectToOutput=demux,
+                             connectWhenAvailable="audio")
+            self.mp3src = self.add_element(
+                "queue", max_size_time=100_000_000, leaky=2)
 
         elif s == "screen":
-            self.addElement("ximagesrc")
-            self.addElement("capsfilter", caps="video/x-raw,framerate=" +
-                            (self.config.get('device.fps', '4') or '4') + "/1")
-            self.addElement("videoconvert")
-            self.addElement("queue", max_size_time=10000000)
-            self.addElement("x264enc", tune="zerolatency",
-                                rc_lookahead=0, bitrate=int(self.dev.config['device.bitrate']), 
-                                key_int_max=int((self.config.get('device.fps', '4') or '4')) * 2)
-            self.addElement(
+            self.add_element("ximagesrc")
+            self.add_element("capsfilter", caps="video/x-raw,framerate=" +
+                             (self.config.get('device.fps', '4') or '4') + "/1")
+            self.add_element("videoconvert")
+            self.add_element("queue", max_size_time=10000000)
+            self.add_element("x264enc", tune="zerolatency",
+                             rc_lookahead=0, bitrate=int(self.dev.config['device.bitrate']),
+                             key_int_max=int((self.config.get('device.fps', '4') or '4')) * 2)
+            self.add_element(
                 "capsfilter", caps="video/x-h264, profile=main")
-            self.addElement("h264parse")
-            self.h264source = self.addElement("tee")
-
-        # Tested
-        # rtspsrc location=rtsp://192.168.1.6:8080/h264_pcm.sdp latency=100 ! queue ! rtph264depay ! h264parse
+            self.add_element("h264parse")
+            self.h264source = self.add_element("tee")
 
         return s
-
-
-import iot_devices.device as devices
 
 
 class NVRChannelRegion(devices.Device):
@@ -483,13 +496,14 @@ class NVRChannelRegion(devices.Device):
         Subdevice used to configure one sub-region of motion detection
     """
     device_type = "NVRChannelRegion"
-    def __init__(self,name, data, **kw):
+
+    def __init__(self, name, data, **kw):
         devices.Device.__init__(self, name, data, **kw)
         self.numeric_data_point("motion_detected",
-                        min=0,
-                        max=1,
-                        subtype='bool',
-                        writable=False)
+                                min=0,
+                                max=1,
+                                subtype='bool',
+                                writable=False)
 
         self.numeric_data_point("raw_motion_value",
                                 min=0,
@@ -497,18 +511,15 @@ class NVRChannelRegion(devices.Device):
                                 writable=False)
 
         self.object_data_point("contained_objects",
-                                    writable=False)
+                               writable=False)
 
         # self.object_data_point("overlapping_objects",
         #                             writable=False)
 
-
         self.set_config_default('device.motion_threshold', '0.08')
-
 
     def processImage(self, img):
         pass
-
 
     def onMotionValue(self, v):
         self.set_data_point("raw_motion_value", v)
@@ -521,7 +532,6 @@ class NVRChannelRegion(devices.Device):
         w = d['w']/overallsize[0]
         h = d['h']/overallsize[1]
 
-
         # Opper right corner in rectangle
         if self.x <= x <= self.x + self.width:
             if self.y <= y <= self.y + self.height:
@@ -532,17 +542,16 @@ class NVRChannelRegion(devices.Device):
 
     def isRectangleOverlapping(self, d):
         R1 = [d['x'], d['y'], d['x'] + d['width'], d['y']+d['width']]
-        R2 = [self.x, self.y, self.x+ self.width, self.y+self.width]
+        R2 = [self.x, self.y, self.x + self.width, self.y+self.width]
 
-        if (R1[0]>=R2[2]) or (R1[2]<=R2[0]) or (R1[3]<=R2[1]) or (R1[1]>=R2[3]):
+        if (R1[0] >= R2[2]) or (R1[2] <= R2[0]) or (R1[3] <= R2[1]) or (R1[1] >= R2[3]):
             return False
         return True
-
 
     def onObjects(self, o):
         # Filter by the objects that are contained within the rectangle
         op = {'objects': []}
-        #oop = {'objects': []}
+        # oop = {'objects': []}
 
         for i in o['objects']:
             if 'x' in i:
@@ -550,20 +559,15 @@ class NVRChannelRegion(devices.Device):
                     op['objects'].append(i)
         self.set_data_point('contained_objects', op)
 
-
         # for i in o['objects']:
         #     if 'x' in i:
         #         if self.isRectangleOverlapping(i):
         #             oop['objects'].append(i)
 
-
         # self.set_data_point('overlapping_objects', oop)
-
-        
 
     def motion(self, v):
         self.set_data_point("motion_detected", v)
-
 
 
 class NVRChannel(devices.Device):
@@ -592,7 +596,7 @@ class NVRChannel(devices.Device):
                 print(traceback.format_exc())
 
     def thread(self):
-        #Has to be at top othherwise other threads wait and get same val.... and we have multiple...
+        # Has to be at top othherwise other threads wait and get same val.... and we have multiple...
         initialValue = self.runWidgetThread
         self.threadStarted = True
         self.threadExited = False
@@ -606,10 +610,10 @@ class NVRChannel(devices.Device):
 
         while self.runWidgetThread and (self.runWidgetThread == initialValue):
             try:
-                x =  f.read(188 * 32)
+                x = f.read(188 * 32)
                 if x is None:
                     return
-                b+=x
+                b += x
             except OSError:
                 time.sleep(0.2)
             except TypeError:
@@ -656,7 +660,8 @@ class NVRChannel(devices.Device):
             print(traceback.format_exc())
 
         try:
-            os.remove(self.rawFeedPipe)
+            if os.path.exists(self.rawFeedPipe):
+                os.remove(self.rawFeedPipe)
         except Exception:
             print(traceback.format_exc())
 
@@ -682,20 +687,21 @@ class NVRChannel(devices.Device):
 
     def getSnapshot(self):
         if hasattr(self, 'snapshotter'):
-            with open("/dev/shm/knvr_buffer/" + self.name + ".bmp","w") as f:
+            with open("/dev/shm/knvr_buffer/" + self.name + ".bmp", "w") as f:
                 os.chmod("/dev/shm/knvr_buffer/" + self.name + ".bmp", 0o700)
             if self.datapoints['running']:
                 try:
 
                     # Use a temp file to make it an atomic operation
                     fn = "/dev/shm/knvr_buffer/" + self.name + ".bmp"
-                    tmpfn ="/dev/shm/knvr_buffer/" + self.name + str(time.time()) + ".bmp"
+                    tmpfn = "/dev/shm/knvr_buffer/" + \
+                        self.name + str(time.time()) + ".bmp"
 
-                    x = self.snapshotter.pullToFile(
-                       tmpfn)
+                    x = self.snapshotter.pull_to_file(
+                        tmpfn)
 
                     shutil.move(tmpfn, fn)
-                    
+
                 except Exception:
                     self.set_data_point('running', 0)
                     if self.process:
@@ -717,7 +723,7 @@ class NVRChannel(devices.Device):
             return
         # Close the old thread
         self.runWidgetThread = time.monotonic()
-        
+
         self.config = config
         if time.monotonic() - self.lastStart < 15:
             return
@@ -772,23 +778,23 @@ class NVRChannel(devices.Device):
         else:
             self.print("COULD NOT STOP OLD THREAD")
 
- 
         self.process = Pipeline()
         self.process.dev = self
 
-        j = False#self.config['device.jack_output'].lower() in ('yes', 'true', 'enable', 'enabled')
+        # self.config['device.jack_output'].lower() in ('yes', 'true', 'enable', 'enabled')
+        j = False
         self.process.getGstreamerSourceData(
             self.config.get('device.source', ''), self.config, self.config.get('device.username', ''), self.config.get('device.password', ''), doJackAudio=j)
 
-        x = self.process.addElement(
+        x = self.process.add_element(
             "queue", connectToOutput=self.process.h264source, max_size_time=10000000)
 
-        self.process.addElement("mpegtsmux", connectToOutput=(
+        self.process.add_element("mpegtsmux", connectToOutput=(
             x, self.process.mp3src))
 
-        self.process.addElement('tsparse', set_timestamps=True)
+        self.process.add_element('tsparse', set_timestamps=True)
 
-        self.mpegtssrc = self.process.addElement("tee")
+        self.mpegtssrc = self.process.add_element("tee")
 
         # Path to be created
         path = self.rawFeedPipe
@@ -806,34 +812,33 @@ class NVRChannel(devices.Device):
 
         os.chmod(path, 0o700)
 
-        self.process.addElement("queue", max_size_time=10000000)
-        self.process.addElement("filesink", location=path,
-                                buffer_mode=2, sync=self.process.syncFile)
+        self.process.add_element("queue", max_size_time=10000000)
+        self.process.add_element("filesink", location=path,
+                                 buffer_mode=2, sync=self.process.syncFile)
 
         # # Motion detection part of the graph
 
         # # This flag discards every unit that cannot be handled individually
-        self.process.addElement(
+        self.process.add_element(
             "identity", drop_buffer_flags=8192, connectToOutput=self.process.h264source)
-        self.process.addElement("queue", max_size_time=20000000,
-                                leaky=2)
-        self.process.addElement("capsfilter", caps="video/x-h264")
+        self.process.add_element("queue", max_size_time=20000000,
+                                 leaky=2)
+        self.process.add_element("capsfilter", caps="video/x-h264")
 
-        self.process.addElement("avdec_h264")
-        # self.process.addElement("videorate",drop_only=True)
-        # self.process.addElement("capsfilter", caps="video/x-raw,framerate=1/1")
+        self.process.add_element("avdec_h264")
+        # self.process.add_element("videorate",drop_only=True)
+        # self.process.add_element("capsfilter", caps="video/x-raw,framerate=1/1")
 
-        rawtee = self.process.addElement("tee")
-        self.process.addElement("queue", max_size_buffers=1, leaky=2)
+        rawtee = self.process.add_element("tee")
+        self.process.add_element("queue", max_size_buffers=1, leaky=2)
 
-        self.snapshotter = self.process.addPILCapture()
+        self.snapshotter = self.process.add_pil_capture()
 
-        self.process.addElement("videoanalyse", connectToOutput=rawtee)
+        self.process.add_element("videoanalyse", connectToOutput=rawtee)
 
         if self.config.get('device.barcodes', '').lower() in ("yes", "true", "detect", "enable", "on"):
-            self.process.addElement("zbar")
+            self.process.add_element("zbar")
             self.print("Barcode detection enabled")
-
 
         # Not a real GST element. The iceflow backend hardcodes this motion/presense detection
         self.process.addPresenceDetector((640, 480), regions=self.regions)
@@ -844,23 +849,23 @@ class NVRChannel(devices.Device):
 
         self.process.presenceval = self.presencevalue
 
-        self.process.addElement("hlssink", connectToOutput=self.mpegtssrc, message_forward=True, async_handling=True, max_files=0,
-                                location=os.path.join(
-                                    "/dev/shm/knvr_buffer/", self.name, r"segment%08d.ts"),
-                                playlist_root=os.path.join(
-                                    "/dev/shm/knvr_buffer/", self.name),
-                                playlist_location=os.path.join(
-                                    "/dev/shm/knvr_buffer/", self.name, "playlist.m3u8"),
-                                target_duration=5)
+        self.process.add_element("hlssink", connectToOutput=self.mpegtssrc, message_forward=True, async_handling=True, max_files=0,
+                                 location=os.path.join(
+                                     "/dev/shm/knvr_buffer/", self.name, r"segment%08d.ts"),
+                                 playlist_root=os.path.join(
+                                     "/dev/shm/knvr_buffer/", self.name),
+                                 playlist_location=os.path.join(
+                                     "/dev/shm/knvr_buffer/", self.name, "playlist.m3u8"),
+                                 target_duration=5)
 
         # We may want to have an SRT source.
         if int(self.config['device.srt_server_port']) > 0:
-            self.process.addElement(
+            self.process.add_element(
                 "queue", leaky=2, max_size_time=200000000, connectToOutput=self.mpegtssrc)
-            self.process.addElement("srtsink", mode=2, localaddress="0.0.0.0", localport=int(
+            self.process.add_element("srtsink", mode=2, localaddress="0.0.0.0", localport=int(
                 self.config['device.srt_server_port']), sync=False)
 
-        self.threadStarted=False
+        self.threadStarted = False
 
         self.datapusher = threading.Thread(
             target=self.thread, daemon=True, name="NVR "+self.name)
@@ -873,7 +878,6 @@ class NVRChannel(devices.Device):
         else:
             if not self.threadStarted:
                 self.print("Thread not started within 25 seconds")
-
 
         self.process.start()
         # Used to check that things are actually still working.
@@ -1107,15 +1111,16 @@ class NVRChannel(devices.Device):
                             self.lastRecordTrigger = time.monotonic()
                             self.lastObjectDetectionHit = time.monotonic()
                             if not self.datapoints['record']:
-                                self.print("Record started because of "+i['class'])
+                                self.print(
+                                    "Record started because of "+i['class'])
 
-                            if self.datapoints['auto_record']>0.5:
+                            if self.datapoints['auto_record'] > 0.5:
                                 self.set_data_point("record", True, None,
                                                     automated_record_uuid)
 
                 else:
                     self.lastRecordTrigger = time.monotonic()
-                    if self.datapoints['auto_record']>0.5:
+                    if self.datapoints['auto_record'] > 0.5:
                         self.set_data_point("record", True, None,
                                             automated_record_uuid)
 
@@ -1215,7 +1220,7 @@ class NVRChannel(devices.Device):
                                     if i['class'] in lookfor and i['confidence'] > 0.35:
                                         relevantObjects += 1
 
-                            if self.oldRelevantObjectCount > -1 and not(self.oldRelevantObjectCount == relevantObjects):
+                            if self.oldRelevantObjectCount > -1 and not (self.oldRelevantObjectCount == relevantObjects):
                                 self.motion(True)
 
                             self.oldRelevantObjectCount = relevantObjects
@@ -1225,7 +1230,7 @@ class NVRChannel(devices.Device):
                                 self.subdevices[i].onObjects(o)
                             # We are going to redo this.
                             # We do it in both places.
-                            # Imagine you detect a person but no motion, but then later see motion, 
+                            # Imagine you detect a person but no motion, but then later see motion,
                             # but no person a few seconds later
                             # You probably want to catch that because a person was likely involved
                             self.doMotionRecordControl(
@@ -1257,6 +1262,7 @@ class NVRChannel(devices.Device):
             self.runWidgetThread = True
             self.runCheckThread = time.monotonic()
 
+            self.lastInferenceTime = 0.0
             self.threadExited = True
             self.closed = False
             self.set_config_default("device.storage_dir", '~/NVR')
@@ -1264,20 +1270,18 @@ class NVRChannel(devices.Device):
             self.set_config_default("device.loop_record_length", '5')
 
             self.set_config_default("device.srt_server_port", '0')
-            
+
             self.set_config_default("device.source", '')
             self.set_config_default("device.username", '')
             self.set_config_default("device.password", '')
             # If this is true, we send the camera audio to JACK if possible
             # self.set_config_default("device.jack_output", 'no')
 
-
-
             # Region data is in the format like regionName=0.3,0.3,0.4,0.2;
             # X, Y, W, H as fraction of image dimension
             self.set_config_default("device.regions", '')
 
-            # Handle region data of the form foo=x,y,w,h; 
+            # Handle region data of the form foo=x,y,w,h;
             regions = {}
             x = self.config['device.regions']
             if x:
@@ -1288,7 +1292,7 @@ class NVRChannel(devices.Device):
                         continue
 
                     n, d = i.split("=")
-                    n=n.strip()
+                    n = n.strip()
                     regions[n] = [float(i.strip()) for i in d.split(',')]
 
                 for i in regions:
@@ -1303,25 +1307,24 @@ class NVRChannel(devices.Device):
 
             self.regions = regions
 
-
             # Support ONVIF URLs
-            self.onvif=None
-            if self.config['device.username'] and self.config['device.password']: 
+            self.onvif = None
+            if self.config['device.username'] and self.config['device.password']:
                 try:
-                    from onvif import ONVIFCamera
-                    if self.config['device.source'] and not self.config['device.source'].startswith('rtsp://') and not self.config['device.source']=='webcam':
+                    if self.config['device.source'] and not self.config['device.source'].startswith('rtsp://') and not self.config['device.source'].startswith('file://') and not self.config['device.source'] in ('webcam', 'screen'):
                         if not self.config['device.source'].startswith('srt://'):
                             p = self.config['device.source'].split("://")[-1]
                             if ':' in p:
                                 port = int(p.split(":")[1])
-                                p=p.split(':')[0]
+                                p = p.split(':')[0]
                             else:
                                 port = 80
 
-                            self.onvif = ONVIFCamera(p,port,self.config['device.username'], self.config['device.password'])
+                            self.onvif = ONVIFCamera(
+                                p, port, self.config['device.username'], self.config['device.password'])
                 except:
                     self.print(traceback.format_exc())
-            
+
             self.process = None
 
             self.lastInferenceTime = 1
@@ -1393,15 +1396,15 @@ class NVRChannel(devices.Device):
                                     subtype='bool',
                                     default=1,
                                     handler=self.commandState)
-    
+
             self.numeric_data_point("auto_record",
-                        min=0,
-                        max=1,
-                        subtype='bool',
-                        default=1,
-                        handler=self.onRecordingChange,
-                        description="Set to 0 to disable automatic new recordings."
-                        )
+                                    min=0,
+                                    max=1,
+                                    subtype='bool',
+                                    default=1,
+                                    handler=self.onRecordingChange,
+                                    description="Set to 0 to disable automatic new recordings."
+                                    )
 
             self.numeric_data_point("record",
                                     min=0,
@@ -1440,14 +1443,13 @@ class NVRChannel(devices.Device):
             self.set_alarm("Camera dark", "luma_average",
                            "value < 0.095", trip_delay=3, auto_ack=True)
             self.set_alarm("Camera low varience", "luma_variance",
-                           "value < 0.008", trip_delay=3, auto_ack=True)
+                           "value < 0.004", trip_delay=3, auto_ack=True)
             self.set_alarm("Long_recording", "record",
                            "value > 0.5", trip_delay=800, auto_ack=True, priority='debug')
 
             self.set_alarm("Not Running", "running",
                            "value < 0.5", trip_delay=90, auto_ack=False, priority='warning')
 
-           
             self.set_config_default("device.fps", '4')
             self.set_config_default("device.barcodes", 'no')
             self.set_config_default("device.object_detection", 'no')
@@ -1489,9 +1491,6 @@ class NVRChannel(devices.Device):
                 'description': "Does nothing without object detection. Only record if there is both motion, and a recognized object on the list in the frame. If empty, always record. Can use any COCO item."
             }
 
-            self.config_properties['device.source'] = {
-                'secret': True
-            }
             self.config_properties['device.password'] = {
                 'secret': True
             }
@@ -1507,18 +1506,15 @@ class NVRChannel(devices.Device):
                 'type': 'region_list'
             }
 
-
             self.streamLock = threading.RLock()
             self.lastStart = 0
 
-            mediaFolders[name] = self
-
             try:
                 self.connect(self.config)
-            except:
+            except Exception:
                 self.handleException()
                 self.set_data_point('running', 0)
-                
+
             self.set_data_point('switch', 1)
 
             # Used to check that things are actually still working.
@@ -1533,12 +1529,8 @@ class NVRChannel(devices.Device):
         except Exception:
             self.handleException()
 
-    def getManagementForm(self):
-        return templateGetter.get_template("manageform.html").render(data=self.data, obj=self)
-
-
     @classmethod
-    def discover_devices(cls, config= {},current_device=None, intent=None, **kw):
+    def discover_devices(cls, config={}, current_device=None, intent=None, **kw):
         # Discover based on the ONVIF cameras.  Let the user fill in username/password.
         l = {}
         for i in onvifCams:
@@ -1555,7 +1547,6 @@ class NVRChannel(devices.Device):
             config2['device.password'] = ''
             l[i] = config2
 
-        
         for i in os.listdir("/dev/"):
             if i.startswith('video'):
                 config2 = config.copy()
@@ -1571,7 +1562,6 @@ class NVRChannel(devices.Device):
                 config2['device.password'] = ''
                 l["Webcam "+i] = config2
 
-
         config2 = config.copy()
         config2.update(
             {
@@ -1584,6 +1574,5 @@ class NVRChannel(devices.Device):
         config2['device.password'] = ''
         config2['device.fps'] = '4'
         l["Screen Recording"] = config2
-
 
         return l
