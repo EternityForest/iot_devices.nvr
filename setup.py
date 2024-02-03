@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='NVRChannel',
-    version='0.1.2',
+    version='0.1.3',
     author="Daniel Dunn",
     author_email="dannydunn@eternityforest.com",
     packages=['NVRChannel',"NVRChannel.NVRChannel"],
