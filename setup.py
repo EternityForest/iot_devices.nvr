@@ -2,10 +2,10 @@ from setuptools import setup
 
 setup(
     name='NVRChannel',
-    version='0.1.3',
+    version='0.1.4',
     author="Daniel Dunn",
     author_email="dannydunn@eternityforest.com",
-    packages=['NVRChannel',"NVRChannel.NVRChannel"],
+    packages=['NVRChannel',"NVRChannel.NVRChannel", "NVRChannel.onvif"],
     package_data={'':["**/*.tflite", '**/*.txt', '**.*.json', "*.json","*.md",]},
     license='MIT',
     long_description=open('README.md').read(),
