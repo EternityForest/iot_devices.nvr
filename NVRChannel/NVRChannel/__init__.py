@@ -1488,7 +1488,7 @@ class NVRChannel(devices.Device):
             }
 
             self.config_properties['device.object_record'] = {
-                'description': "Does nothing without object detection. Only record if there is both motion, and a recognized object on the list in the frame. If empty, always record. Can use any COCO item."
+                'description': "Does nothing without object detection and motion record enabled. Only record if there is both motion, and a recognized object on the list in the frame. If empty, always record. Can use any COCO item."
             }
 
             self.config_properties['device.password'] = {
