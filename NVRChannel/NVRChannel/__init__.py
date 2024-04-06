@@ -122,8 +122,7 @@ def recognize_tflite(i: bytes | bytearray, device: NVRChannel):
     invoke_time = time.time()
 
     pil_img = PIL.Image.open(io.BytesIO(i))
-    filtered = pil_img.filter(PIL.ImageFilter.GaussianBlur(1))
-    filtered = PIL.ImageOps.autocontrast(filtered, cutoff=5)
+    filtered = PIL.ImageOps.autocontrast(pil_img, cutoff=5)
 
     if not objectDetector[0]:
         interpreter = tflite.Interpreter(num_threads=4, model_path=os.path.join(
@@ -304,7 +303,7 @@ class Pipeline(iceflow.GstreamerPipeline):
     def on_presence_value(self, v):
         self.presenceval(v)
 
-    def onVideoAnalyze(self, *a, **k):
+    def on_video_analyze(self, *a, **k):
         self.acb(*a)
 
     def on_barcode(self, *a, **k):
@@ -841,7 +840,7 @@ class NVRChannel(devices.Device):
             self.print("Barcode detection enabled")
 
         # Not a real GST element. The iceflow backend hardcodes this motion/presense detection
-        self.process.addPresenceDetector((640, 480), regions=self.regions)
+        self.process.add_presence_detector((640, 480), regions=self.regions)
 
         self.process.mcb = self.motion
         self.process.bcb = self.barcode
@@ -956,7 +955,7 @@ class NVRChannel(devices.Device):
         with open(os.path.join(self.segmentDir, "thumbnail.jpg"), 'wb') as f:
             x.save(f, 'jpeg')
 
-    def onMultiFileSink(self, fn, *a, **k):
+    def on_multi_file_sink(self, fn, *a, **k):
         with self.recordlock:
             self.moveSegments()
             d = os.path.join("/dev/shm/knvr_buffer/", self.name)
@@ -1059,7 +1058,7 @@ class NVRChannel(devices.Device):
         # If there is a ton of files run the poller anyway, if could have stalled because it ran out of memory
         # because something caused things to block long enough for it all to fill up.
         if (not ls == self.lastshm) or len(ls) > 16:
-            self.onMultiFileSink('')
+            self.on_multi_file_sink('')
         self.lastshm = ls
 
     def commandState(self, v, t, a):
@@ -1114,13 +1113,13 @@ class NVRChannel(devices.Device):
                                 self.print(
                                     "Record started because of "+i['class'])
 
-                            if self.datapoints['auto_record'] > 0.5:
+                            if (self.datapoints['auto_record'] or 1) > 0.5:
                                 self.set_data_point("record", True, None,
                                                     automated_record_uuid)
 
                 else:
                     self.lastRecordTrigger = time.monotonic()
-                    if self.datapoints['auto_record'] > 0.5:
+                    if (self.datapoints['auto_record'] or 1) > 0.5:
                         self.set_data_point("record", True, None,
                                             automated_record_uuid)
 
