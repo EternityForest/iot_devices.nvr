@@ -16,7 +16,8 @@ from datetime import timezone
 from zeroconf import ServiceBrowser, ServiceStateChange
 import numpy as np
 import iot_devices.device as devices
-from scullery import iceflow, workers
+from scullery import workers
+from icemedia import iceflow
 import tflite_runtime.interpreter as tflite
 import cv2
 import PIL.Image
