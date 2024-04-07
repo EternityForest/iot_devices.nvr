@@ -838,7 +838,6 @@ class NVRChannel(devices.Device):
 
         if self.config.get('device.barcodes', '').lower() in ("yes", "true", "detect", "enable", "on"):
             self.process.add_element("zbar")
-            self.print("Barcode detection enabled")
 
         # Not a real GST element. The iceflow backend hardcodes this motion/presense detection
         self.process.add_presence_detector((640, 480), regions=self.regions)
@@ -1322,7 +1321,7 @@ class NVRChannel(devices.Device):
 
                             self.onvif = ONVIFCamera(
                                 p, port, self.config['device.username'], self.config['device.password'])
-                except:
+                except Exception:
                     self.print(traceback.format_exc())
 
             self.process = None
