@@ -18,7 +18,7 @@ import numpy as np
 import iot_devices.device as devices
 from scullery import workers
 from icemedia import iceflow
-import tflite_runtime.interpreter as tflite
+import cvlib
 import cv2
 import PIL.Image
 import PIL.ImageOps
@@ -75,18 +75,64 @@ def get_rtsp_from_onvif(c: ONVIFCamera):
     return resp.Uri
 
 
-# Just easy mutable containers
-objectDetector: list[Optional[tflite.Interpreter]] = [None]
-tf_labels: list[Optional[np.ndarray]] = [None]
+# Model source: https://github.com/chuanqi305/MobileNet-SSD/
+
+# MIT License
+
+# Copyright (c) 2018 chuanqi305
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# Load the Caffe model
+net = cv2.dnn.readNetFromCaffe(
+    os.path.join(os.path.dirname(__file__), "MobileNetSSD_deploy.prototxt"),
+    os.path.join(os.path.dirname(__file__), "MobileNetSSD_deploy.caffemodel"),
+)
+
 
 # Only one of these should happpen at a time. Because we need to limit how much CPU it can burn.
 object_detection_lock = threading.RLock()
 
-
-def get_output_layers(net):
-    layer_names = net.getLayerNames()
-    output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
-    return output_layers
+# Labels of Network.
+classNames = {
+    0: "background",
+    1: "aeroplane",
+    2: "bicycle",
+    3: "bird",
+    4: "boat",
+    5: "bottle",
+    6: "bus",
+    7: "car",
+    8: "cat",
+    9: "chair",
+    10: "cow",
+    11: "diningtable",
+    12: "dog",
+    13: "horse",
+    14: "motorbike",
+    15: "person",
+    16: "pottedplant",
+    17: "sheep",
+    18: "sofa",
+    19: "train",
+    20: "tvmonitor",
+}
 
 
 def toImgOpenCV(imgPIL):  # Conver imgPIL to imgOpenCV
@@ -114,143 +160,102 @@ def letterbox_image(image, size):
     return new_image
 
 
-# We get the model from here and export it as tflite without any extra quantization:
-# https://github.com/google/automl/blob/master/efficientdet/README.md
-
-# Label map: https://github.com/joonb14/TFLiteDetection
-
-
-def recognize_tflite(i: bytes | bytearray, device: NVRChannel):
+def recognize_objects(img: bytes | bytearray):
     invoke_time = time.time()
 
-    pil_img = PIL.Image.open(io.BytesIO(i))
+    pil_img = PIL.Image.open(io.BytesIO(img))
     filtered = PIL.ImageOps.autocontrast(pil_img, cutoff=5)
+    frame = toImgOpenCV(filtered)
 
-    if not objectDetector[0]:
-        interpreter = tflite.Interpreter(
-            num_threads=4,
-            model_path=os.path.join(path, "efficientdet/efficientdet-lite0-f32.tflite"),
-        )
+    frame_resized = letterbox_image(frame, (300, 300))
+    frame_resized = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
 
-        interpreter.allocate_tensors()
-        objectDetector[0] = interpreter
+    blob = cv2.dnn.blobFromImage(
+        frame_resized, 0.007843, (300, 300), (127.5, 127.5, 127.5), False
+    )
+    net.setInput(blob)
+    detections = net.forward()
 
-    # Sigh.  So many breaking changes to watch for!
-    # https://stackoverflow.com/questions/74379966/typeerror-text-reading-control-character-must-be-a-single-unicode-character-or
-    if tf_labels[0] is None:
-        try:
-            tf_labels[0] = np.loadtxt(
-                os.path.join(path, "labelmap.txt"), dtype=str, delimiter="/n"
-            )
-        except Exception:
-            tf_labels[0] = np.genfromtxt(
-                os.path.join(path, "labelmap.txt"), dtype=str, delimiter="/n"
-            )
-
-    interpreter = objectDetector[0]
-    labels = tf_labels[0]
-
-    original_image = toImgOpenCV(filtered)
-    # Get input and output tensors.
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-
-    tensor_w = input_details[0]["shape"][1]
-    tensor_h = input_details[0]["shape"][2]
-
-    image = letterbox_image(original_image, (tensor_w, tensor_h))
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-    input_image = np.expand_dims(image, 0)
-
-    interpreter.set_tensor(input_details[0]["index"], input_image)
-    original_image_h = original_image.shape[0]
-    original_image_w = original_image.shape[1]
-
-    interpreter.invoke()
+    cols = frame.shape[1]
+    rows = frame.shape[0]
     t = time.time() - invoke_time
-    device.lastInferenceTime = t
-
-    # The function `get_tensor()` returns a copy of the tensor data.
-    # Use `tensor()` in order to get a pointer to the tensor.
-
-    o = interpreter.get_tensor(output_details[0]["index"])[0]
-    probability = np.array([i[5] for i in o])
-
-    # Our dynamically chosen confidence threshhold meant to pick up things in dim light
-    p = float(max(min(0.10, float(probability.max()) * 0.8), 0.01))
-
     retval = []
 
-    # All this is reverse engineered from looging at the output.
-    for i in o:
-        if float(i[5]) < p:
-            continue
-        if int(i[6]) < 1:
-            continue
+    # For get the class and location of object detected,
+    # There is a fix index for class, location and confidence
+    # value in @detections array .
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]  # Confidence of prediction
+        if confidence > 0.1:  # Filter prediction
+            class_id = int(detections[0, 0, i, 1])  # Class label
 
-        x, y, x2, y2 = (
-            float((i[2] / tensor_w) * original_image_w),
-            float((i[1] / tensor_h) * original_image_h),
-            float((i[4] / tensor_w) * original_image_w),
-            float((i[3] / tensor_h) * original_image_h),
-        )
+            # Object location
+            xLeftBottom = int(detections[0, 0, i, 3] * cols)
+            yLeftBottom = int(detections[0, 0, i, 4] * rows)
+            xRightTop = int(detections[0, 0, i, 5] * cols)
+            yRightTop = int(detections[0, 0, i, 6] * rows)
 
-        x = min(x, x2)
-        w = max(x, x2) - x
-        y = min(y, y2)
-        h = max(y, y2) - y
+            # Factor for scale to original size of frame
+            heightFactor = frame.shape[0] / 300.0
+            widthFactor = frame.shape[1] / 300.0
+            # Scale object detection to frame
+            xLeftBottom = int(widthFactor * xLeftBottom)
+            yLeftBottom = int(heightFactor * yLeftBottom)
+            xRightTop = int(widthFactor * xRightTop)
+            yRightTop = int(heightFactor * yRightTop)
 
-        confidence = float(i[5])
-        label = labels[int(i[6]) - 1]
+            x = min(xRightTop, xLeftBottom)
+            w = max(xRightTop, xLeftBottom) - x
+            y = min(yRightTop, yLeftBottom)
+            h = max(yRightTop, yLeftBottom) - y
 
-        v = {
-            "x": float(x),
-            "y": float(y),
-            "w": float(w),
-            "h": float(h),
-            "class": label,
-            "confidence": confidence,
-        }
+            v = {
+                "x": float(x),
+                "y": float(y),
+                "w": float(w),
+                "h": float(h),
+                "class": classNames[class_id],
+                "confidence": float(confidence),
+            }
 
-        if x2 > (original_image_w - 20) and confidence < 0.2:
-            continue
-        if y2 > (original_image_h - 10) and confidence < 0.15:
-            continue
-        # For some reason I am consistently getting false positive people detections
-        #  with y values in the -6 to 15 range
-        # Could just be my input data.  But, things are usually not that high up unless
-        #  they are big and big means a clear view which means
-        # you probably would have a higher confidence
-        if (x > 1 and y > 24) or confidence > 0.33:
-            # If something takes up a very large amount of the frame, we probably have a clear view of it.
-            # If we are still not confident the ANN
-            # Is probably making stuff up.  Very large things are going to be uncommon since most cameras like
-            # this aren't doing extreme close ups
-            # and the ones that are probably have good lighting
-            if ((w < original_image_w / 4) or (confidence > 0.18)) and (
-                (h < (original_image_h / 3)) or (confidence > 0.15)
-            ):
-                if (w < (original_image_w / 2.5) or (confidence > 0.48)) and (
-                    h < (original_image_h / 1.8) or (confidence > 0.48)
+            if xRightTop > (frame.shape[0] - 20) and confidence < 0.7:
+                continue
+            if yLeftBottom > (frame.shape[1] - 10) and confidence < 0.7:
+                continue
+            # For some reason I am consistently getting false positive people detections
+            #  with y values in the -6 to 15 range
+            # Could just be my input data.  But, things are usually not that high up unless
+            #  they are big and big means a clear view which means
+            # you probably would have a higher confidence
+            if (x > 1 and y > 24) or confidence > 0.33:
+                # If something takes up a very large amount of the frame, we probably have a clear view of it.
+                # If we are still not confident the ANN
+                # Is probably making stuff up.  Very large things are going to be uncommon since most cameras like
+                # this aren't doing extreme close ups
+                # and the ones that are probably have good lighting
+                if ((w < frame.shape[0] / 4) or (confidence > 0.7)) and (
+                    (h < (frame.shape[1] / 3)) or (confidence > 0.7)
                 ):
-                    # If the width of this object is such that more than 2/3d is off of the frame, we had better be very confident
-                    # because that seems to be a common pattern of false positives.
-                    if ((original_image_w - x) > w / 3) or confidence > 0.4:
-                        retval.append(v)
+                    if (w < (frame.shape[0] / 2.5) or (confidence > 0.5)) and (
+                        h < (frame.shape[1] / 1.8) or (confidence > 0.5)
+                    ):
+                        # If the width of this object is such that more than 2/3d is off of the frame, we had better be very confident
+                        # because that seems to be a common pattern of false positives.
+                        if ((frame.shape[0] - x) > w / 3) or confidence > 0.4:
+                            retval.append(v)
+                        else:
+                            pass  # print(v, "reject large offscreen")
                     else:
-                        pass  # print(v, "reject large offscreen")
+                        pass  # print(v, "reject to large for confidence 2")
                 else:
-                    pass  # print(v, "reject to large for confidence 2")
+                    pass  # print(v, "reject too large for confidence")
             else:
-                pass  # print(v, "reject too large for confidence")
-        else:
-            pass  # print(v,"reject low xy")
+                pass  # print(v,"reject low xy")
 
     return {
         "objects": retval,
-        "x-inferencetime": t,
-        "x-imagesize": [original_image_w, original_image_h],
+        "x_inferencetime": t,
+        "x_imagesize": [frame.shape[0], frame.shape[1]],
     }
 
 
@@ -393,16 +398,16 @@ class Pipeline(iceflow.GstreamerPipeline):
                     dm = self.add_element("matroskademux")
                 else:
                     dm = self.add_element("qtdemux")
-                self.add_element("h264parse", connectWhenAvailable="video/x-h264")
+                self.add_element("h264parse", connect_when_available="video/x-h264")
                 # self.add_element('identity', sync=True)
                 self.syncFile = True
                 self.add_element("queue", max_size_time=10000000)
 
                 self.h264source = self.add_element("tee")
                 self.add_element(
-                    "decodebin3", connectToOutput=dm, connectWhenAvailable="audio"
+                    "decodebin3", connectToOutput=dm, connect_when_available="audio"
                 )
-                self.add_element("audioconvert", connectWhenAvailable="audio")
+                self.add_element("audioconvert", connect_when_available="audio")
 
                 self.add_element("audiorate")
                 self.add_element("queue", max_size_time=10000000)
@@ -454,7 +459,7 @@ class Pipeline(iceflow.GstreamerPipeline):
             self.add_element("h264parse")
             self.h264source = self.add_element("tee")
 
-        elif s == "webcam" or s == "webcam_audio":
+        elif s in ("webcam", "webcam_pipewire", "webcam_audio"):
             self.add_element("v4l2src")
             self.add_element("videorate", drop_only=True)
             self.add_element(
@@ -476,7 +481,12 @@ class Pipeline(iceflow.GstreamerPipeline):
             self.add_element("h264parse", config_interval=1)
             self.h264source = self.add_element("tee")
 
-            self.add_element("alsasrc", connectToOutput=False)
+            if s == "webcam_pipewire":
+                self.add_element("pipewiresrc", connectToOutput=False)
+            if s == "webcam_audio":
+                self.add_element("autoaudiosrc", connectToOutput=False)
+            else:
+                self.add_element("audiotestsrc", wave=4)
             self.add_element("queue")
             self.add_element("audioconvert")
 
@@ -498,21 +508,23 @@ class Pipeline(iceflow.GstreamerPipeline):
                 user_id=un or None,
                 user_pw=pw or None,
             )
-            self.add_element("rtph264depay", connectWhenAvailable="video")
+            self.add_element("rtph264depay", connect_when_available="video")
 
             self.add_element("h264parse", config_interval=1)
-
+            self.add_element(
+                "capsfilter", caps="video/x-h264,stream-format=byte-stream"
+            )
             self.h264source = self.add_element("tee")
 
             self.add_element(
                 "decodebin",
                 connectToOutput=rtsp,
-                connectWhenAvailable="audio",
+                connect_when_available="audio",
                 async_handling=True,
             )
 
             if doJackAudio:
-                rawaudiotee = self.add_element("tee", connectWhenAvailable="audio")
+                rawaudiotee = self.add_element("tee", connect_when_available="audio")
 
             self.add_element("audioconvert")
             self.add_element("audiorate")
@@ -526,7 +538,7 @@ class Pipeline(iceflow.GstreamerPipeline):
                     "queue",
                     max_size_time=100_000_000,
                     leaky=2,
-                    connectWhenAvailable="audio",
+                    connect_when_available="audio",
                     connectToOutput=rawaudiotee,
                 )
                 self.sink = self.add_element(
@@ -547,14 +559,17 @@ class Pipeline(iceflow.GstreamerPipeline):
 
             demux = self.add_element("tsdemux")
             self.add_element(
-                "h264parse", config_interval=2, connectWhenAvailable="video"
+                "h264parse", config_interval=2, connect_when_available="video"
+            )
+            self.add_element(
+                "capsfilter", caps="video/x-h264,stream-format=byte-stream"
             )
             self.add_element("queue", max_size_time=100_000_000, leaky=2)
 
             self.h264source = self.add_element("tee")
 
             self.add_element(
-                "aacparse", connectToOutput=demux, connectWhenAvailable="audio"
+                "aacparse", connectToOutput=demux, connect_when_available="audio"
             )
             self.mp3src = self.add_element("queue", max_size_time=100_000_000, leaky=2)
 
@@ -577,6 +592,9 @@ class Pipeline(iceflow.GstreamerPipeline):
             )
             self.add_element("capsfilter", caps="video/x-h264, profile=main")
             self.add_element("h264parse")
+            self.add_element(
+                "capsfilter", caps="video/x-h264,stream-format=byte-stream"
+            )
             self.h264source = self.add_element("tee")
 
         return s
@@ -640,7 +658,7 @@ class NVRChannelRegion(devices.Device):
 
         for i in o["objects"]:
             if "x" in i:
-                if self.isRectangleContained(i, o["x-imagesize"]):
+                if self.isRectangleContained(i, o["x_imagesize"]):
                     op["objects"].append(i)
         self.set_data_point("contained_objects", op)
 
@@ -667,10 +685,10 @@ class NVRChannel(devices.Device):
             try:
                 f = os.open(self.rawFeedPipe, flags=os.O_NONBLOCK | os.O_APPEND)
                 s = 0
-                for i in range(188 * 42):
+                for i in range(188):
                     r, w, x = select.select([], [f], [], 0.2)
                     if w:
-                        f.write(b"b")
+                        f.write(b"b" * 42)
                     else:
                         s += 1
                         if s > 15:
@@ -713,9 +731,10 @@ class NVRChannel(devices.Device):
 
             if self.runWidgetThread:
                 if len(b) > (188 * 256) or (lp < (time.monotonic() - 0.2) and b):
-                    lp = time.monotonic()
-                    self.push_bytes("raw_feed", b)
-                    self.lastPushedWSData = time.monotonic()
+                    if self.runWidgetThread and (self.runWidgetThread == initialValue):
+                        lp = time.monotonic()
+                        self.push_bytes("raw_feed", b)
+                        self.lastPushedWSData = time.monotonic()
                     b = b""
         self.threadExited = True
 
@@ -1375,7 +1394,8 @@ class NVRChannel(devices.Device):
                             x = self.request_data_point("bmp_snapshot")
                             if not x:
                                 return
-                            o = recognize_tflite(x, self)
+                            o = recognize_objects(x)
+                            self.lastInferenceTime = o["x_inferencetime"]
                             self.lastDidObjectRecognition = time.monotonic()
                             self.lastObjectSet = o
 
@@ -1423,8 +1443,8 @@ class NVRChannel(devices.Device):
             self.doMotionRecordControl(self.datapoints["motion_detected"], True)
 
     def analysis(self, v):
-        self.set_data_point("luma_average", v["luma-average"])
-        self.set_data_point("luma_variance", v["luma-variance"])
+        self.set_data_point("luma_average", v["luma_average"])
+        self.set_data_point("luma_variance", v["luma_variance"])
 
     def barcode(self, t, d, q):
         self.set_data_point(
@@ -1590,6 +1610,7 @@ class NVRChannel(devices.Device):
                 subtype="bool",
                 default=1,
                 handler=self.commandState,
+                dashboard=False,
             )
 
             self.numeric_data_point(
@@ -1600,6 +1621,7 @@ class NVRChannel(devices.Device):
                 default=1,
                 handler=self.onRecordingChange,
                 description="Set to 0 to disable automatic new recordings.",
+                dashboard=False,
             )
 
             self.numeric_data_point(
@@ -1619,11 +1641,15 @@ class NVRChannel(devices.Device):
                 "motion_detected", min=0, max=1, subtype="bool", writable=False
             )
 
-            self.numeric_data_point("raw_motion_value", min=0, max=10, writable=False)
+            self.numeric_data_point(
+                "raw_motion_value", min=0, max=10, writable=False, dashboard=False
+            )
 
             self.numeric_data_point("luma_average", min=0, max=1, writable=False)
 
-            self.numeric_data_point("luma_variance", min=0, max=1, writable=False)
+            self.numeric_data_point(
+                "luma_variance", min=0, max=1, writable=False, dashboard=False
+            )
 
             self.set_alarm(
                 "Camera dark",

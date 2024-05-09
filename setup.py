@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="NVRChannel",
-    version="0.1.5",
+    version="0.1.6",
     author="Daniel Dunn",
     author_email="dannydunn@eternityforest.com",
     packages=["NVRChannel", "NVRChannel.NVRChannel", "NVRChannel.onvif"],
@@ -22,7 +22,7 @@ setup(
     dependencies=[
         "opencv-python",
         "Pillow",
-        "tflite-runtime",
+        "cvlib",
         "icemedia",
         "scullery",
         "zeep",
