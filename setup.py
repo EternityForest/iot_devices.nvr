@@ -2,13 +2,14 @@ from setuptools import setup
 
 setup(
     name="NVRChannel",
-    version="0.1.6",
+    version="0.1.7",
     author="Daniel Dunn",
     author_email="dannydunn@eternityforest.com",
     packages=["NVRChannel", "NVRChannel.NVRChannel", "NVRChannel.onvif"],
     package_data={
         "": [
-            "**/*.tflite",
+            "**/*.caffemodel",
+            "**/*.prototxt",
             "**/*.txt",
             "**.*.json",
             "*.json",
