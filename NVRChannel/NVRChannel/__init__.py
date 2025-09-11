@@ -18,7 +18,6 @@ import numpy as np
 import iot_devices.device as devices
 from scullery import workers
 from icemedia import iceflow
-import cvlib
 import cv2
 import PIL.Image
 import PIL.ImageOps
@@ -99,11 +98,33 @@ def get_rtsp_from_onvif(c: ONVIFCamera):
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# Load the Caffe model
-net = cv2.dnn.readNetFromCaffe(
-    os.path.join(os.path.dirname(__file__), "MobileNetSSD_deploy.prototxt"),
-    os.path.join(os.path.dirname(__file__), "MobileNetSSD_deploy.caffemodel"),
-)
+
+
+
+net = None
+
+def getCaffeModel(device: NVRChannel):
+    global net
+
+    try:
+        device.print("Loading MobileNet-SSD model")
+        import huggingface_hub
+
+        cm = huggingface_hub.hf_hub_download(
+            repo_id="Imran606/cds", filename="MobileNetSSD_deploy.caffemodel",
+                repo_type="space"
+        )
+        prototext = huggingface_hub.hf_hub_download(
+            repo_id="Imran606/cds", filename="MobileNetSSD_deploy.prototxt",
+            repo_type="space"
+        )
+
+        net = cv2.dnn.readNetFromCaffe(prototext, cm)
+    except Exception:
+        device.handle_exception()
+
+    device.print("Loaded MobileNet-SSD model")
+
 
 
 # Only one of these should happpen at a time. Because we need to limit how much CPU it can burn.
@@ -161,6 +182,16 @@ def letterbox_image(image, size):
 
 
 def recognize_objects(img: bytes | bytearray):
+    global net
+    if not net:
+        return {
+            "objects": [],
+            "x_inferencetime": 0,
+            "x_imagesize": [0,0],
+            "x_net_not_loaded": True
+        }
+
+
     invoke_time = time.time()
 
     pil_img = PIL.Image.open(io.BytesIO(img))
@@ -609,6 +640,13 @@ class NVRChannelRegion(devices.Device):
 
     def __init__(self, name, data, **kw):
         devices.Device.__init__(self, name, data, **kw)
+
+        def f():
+            getCaffeModel(self)
+        t = threading.Thread(target=f, name="getCaffeModel")
+        t.daemon = True
+        t.start()
+
         self.numeric_data_point(
             "motion_detected", min=0, max=1, subtype="bool", writable=False
         )
@@ -708,7 +746,7 @@ class NVRChannel(devices.Device):
             time.sleep(1)
 
         f = open(self.rawFeedPipe, "rb")
-        lp = time.monotonic()
+        lp = time.time()
 
         while self.runWidgetThread and (self.runWidgetThread == initialValue):
             try:
@@ -730,11 +768,11 @@ class NVRChannel(devices.Device):
                 print(traceback.format_exc())
 
             if self.runWidgetThread:
-                if len(b) > (188 * 256) or (lp < (time.monotonic() - 0.2) and b):
+                if len(b) > (188 * 256) or (lp < (time.time() - 0.2) and b):
                     if self.runWidgetThread and (self.runWidgetThread == initialValue):
-                        lp = time.monotonic()
+                        lp = time.time()
                         self.push_bytes("raw_feed", b)
-                        self.lastPushedWSData = time.monotonic()
+                        self.lastPushedWSData = time.time()
                     b = b""
         self.threadExited = True
 
@@ -803,6 +841,12 @@ class NVRChannel(devices.Device):
 
                     x = self.snapshotter.pull_to_file(tmpfn)
 
+                    st = time.monotonic()
+                    while not os.path.exists(tmpfn):
+                        time.sleep(0.01)
+                        if time.monotonic() - st > 0.2:
+                            break
+
                     shutil.move(tmpfn, fn)
 
                 except Exception:
@@ -825,10 +869,10 @@ class NVRChannel(devices.Device):
         if self.closed:
             return
         # Close the old thread
-        self.runWidgetThread = time.monotonic()
+        self.runWidgetThread = time.time()
 
         self.config = config
-        if time.monotonic() - self.lastStart < 15:
+        if time.time() - self.lastStart < 15:
             return
 
         # When we reconnect we stop the recording and motion
@@ -837,7 +881,7 @@ class NVRChannel(devices.Device):
         self.set_data_point("motion_detected", 0)
         self.activeSegmentDir = self.segmentDir = None
 
-        self.lastStart = time.monotonic()
+        self.lastStart = time.time()
 
         if self.process:
             try:
@@ -847,8 +891,8 @@ class NVRChannel(devices.Device):
 
         # Used to check that things are actually still working.
         # Set them to prevent a loop.
-        self.lastSegment = time.monotonic()
-        self.lastPushedWSData = time.monotonic()
+        self.lastSegment = time.time()
+        self.lastPushedWSData = time.time()
 
         # Can't stop as soon as they push stop, still need to capture
         # the currently being recorded segment
@@ -870,7 +914,7 @@ class NVRChannel(devices.Device):
             pass
 
         # Close the old thread
-        self.runWidgetThread = time.monotonic()
+        self.runWidgetThread = time.time()
         self.putTrashInBuffer()
         s = 100
         while s:
@@ -1013,8 +1057,8 @@ class NVRChannel(devices.Device):
         self.process.start()
         # Used to check that things are actually still working.
         # Set them to prevent a loop.
-        self.lastSegment = time.monotonic()
-        self.lastPushedWSData = time.monotonic()
+        self.lastSegment = time.time()
+        self.lastPushedWSData = time.time()
 
     def onRecordingChange(self, v, t, a):
         with self.recordlock:
@@ -1083,11 +1127,15 @@ class NVRChannel(devices.Device):
         # Capture a tiny preview snapshot
         import PIL
 
-        x = PIL.Image.open(io.BytesIO(self.request_data_point("bmp_snapshot")))
-        x.thumbnail((320, 240))
-        x = PIL.ImageOps.autocontrast(x, cutoff=0.1)
-        with open(os.path.join(self.segmentDir, "thumbnail.jpg"), "wb") as f:
-            x.save(f, "jpeg")
+        # todo make the bmp thing reliable
+        try:
+            x = PIL.Image.open(io.BytesIO(self.request_data_point("bmp_snapshot")))
+            x.thumbnail((320, 240))
+            x = PIL.ImageOps.autocontrast(x, cutoff=0.1)
+            with open(os.path.join(self.segmentDir, "thumbnail.jpg"), "wb") as f:
+                x.save(f, "jpeg")
+        except Exception:
+            print(traceback.format_exc())
 
     def on_multi_file_sink(self, fn, *a, **k):
         with self.recordlock:
@@ -1107,7 +1155,7 @@ class NVRChannel(devices.Device):
                     break
                 s -= 1
                 os.remove(os.path.join(d, ls[0]))
-                self.lastSegment = time.monotonic()
+                self.lastSegment = time.time()
                 self.set_data_point("running", 1)
 
                 ls = os.listdir(d)
@@ -1129,7 +1177,7 @@ class NVRChannel(devices.Device):
             if self.activeSegmentDir or self.segmentDir:
                 # Ignore latest, that could still be recording
                 for i in ls[:-1]:
-                    self.lastSegment = time.monotonic()
+                    self.lastSegment = time.time()
                     self.set_data_point("running", 1)
 
                     # Someone could delete a segment dir while it is being written to.
@@ -1189,13 +1237,13 @@ class NVRChannel(devices.Device):
         "Pretty mush all periodic tasks go here"
 
         # Make sure we are actually getting video frames. Otherwise we reconnect.
-        if not self.lastSegment > (time.monotonic() - 15):
+        if not self.lastSegment > (time.time() - 15):
             self.set_data_point("running", False)
             if self.datapoints.get("switch", 1):
                 self.connect(self.config)
                 return
 
-        if not self.lastPushedWSData > (time.monotonic() - 15):
+        if not self.lastPushedWSData > (time.time() - 15):
             self.set_data_point("running", False)
             if self.datapoints.get("switch", 1):
                 self.connect(self.config)
@@ -1229,10 +1277,6 @@ class NVRChannel(devices.Device):
                     time.sleep(0.1)
             else:
                 self.check()
-
-    def handle_web_request(self, relpath, params, method, **kwargs):
-        if relpath[0] == "live":
-            self.serve_file(os.path.join("/dev/shm/knvr/", self.name, *(relpath[1:])))
 
     def motion(self, v):
         self.doMotionRecordControl(v)
@@ -1268,8 +1312,8 @@ class NVRChannel(devices.Device):
                 ):
                     for i in self.lastObjectSet["objects"]:
                         if i["class"] in lookfor:
-                            self.lastRecordTrigger = time.monotonic()
-                            self.lastObjectDetectionHit = time.monotonic()
+                            self.lastRecordTrigger = time.time()
+                            self.lastObjectDetectionHit = time.time()
                             if not self.datapoints["record"]:
                                 self.print("Record started because of " + i["class"])
 
@@ -1279,12 +1323,12 @@ class NVRChannel(devices.Device):
                                 )
 
                 else:
-                    self.lastRecordTrigger = time.monotonic()
+                    self.lastRecordTrigger = time.time()
                     if (self.datapoints["auto_record"] or 1) > 0.5:
                         self.set_data_point("record", True, None, automated_record_uuid)
 
             elif not v and self.canAutoStopRecord:
-                if self.lastRecordTrigger < (time.monotonic() - 12):
+                if self.lastRecordTrigger < (time.time() - 12):
                     # Even if there is still motion, if we have object detection data coming in but have not seen the object recently, stop if we are in objetc detecting
                     # mode
 
@@ -1293,11 +1337,11 @@ class NVRChannel(devices.Device):
                     # Our window is 3 sucessive runs with no object hits.  Our window never goes past 30 seconds.
                     window = min(
                         self.lastDidObjectRecognition
-                        - ((time.monotonic() - self.lastDidObjectRecognition) * 3),
+                        - ((time.time() - self.lastDidObjectRecognition) * 3),
                         30,
                     )
-                    if (self.lastRecordTrigger < (time.monotonic() - 60)) or (
-                        (self.lastDidObjectRecognition > (time.monotonic() - 15))
+                    if (self.lastRecordTrigger < (time.time() - 60)) or (
+                        (self.lastDidObjectRecognition > (time.time() - 15))
                         and lookfor
                         and (self.lastObjectDetectionHit < window)
                     ):
@@ -1305,7 +1349,7 @@ class NVRChannel(devices.Device):
                             "record", False, None, automated_record_uuid
                         )
 
-        self.lastDidMotionRecordControl = time.monotonic()
+        self.lastDidMotionRecordControl = time.time()
 
     def presencevalue(self, v):
         "Takes a raw presence value. Unfortunately it seems we need to do our own motion detection."
@@ -1342,13 +1386,13 @@ class NVRChannel(devices.Device):
 
         if objects and (
             (v > float(self.config.get("device.motion_threshold", 0.08)))
-            or (self.lastDidObjectRecognition < time.monotonic() - detect_interval)
+            or (self.lastDidObjectRecognition < time.time() - detect_interval)
         ):
             # Limit CPU usage. But don't limit so much we go more than 5s between detections
             if (
                 self.lastDidObjectRecognition - min(self.lastInferenceTime * 1.1, 5)
-            ) < time.monotonic() - min(self.lastInferenceTime * 1.1, 5):
-                self.obj_rec_wait_timestamp = time.monotonic()
+            ) < time.time() - min(self.lastInferenceTime * 1.1, 5):
+                self.obj_rec_wait_timestamp = time.time()
                 obj_rec_wait = self.obj_rec_wait_timestamp
 
                 def f():
@@ -1379,7 +1423,7 @@ class NVRChannel(devices.Device):
 
                     # If we have not seen any objects lately, better check more often because
                     # We might be about to stop the recording even if there is still motion, so it must be accurate.
-                    if self.lastObjectDetectionHit > (time.monotonic() - 15):
+                    if self.lastObjectDetectionHit > (time.time() - 15):
                         t = 3 if self.datapoints["record"] else (n * 0.75)
                     else:
                         t = n * 0.75
@@ -1396,7 +1440,7 @@ class NVRChannel(devices.Device):
                                 return
                             o = recognize_objects(x)
                             self.lastInferenceTime = o["x_inferencetime"]
-                            self.lastDidObjectRecognition = time.monotonic()
+                            self.lastDidObjectRecognition = time.time()
                             self.lastObjectSet = o
 
                             lookfor = self.config.get(
@@ -1461,7 +1505,7 @@ class NVRChannel(devices.Device):
         devices.Device.__init__(self, name, data, **kw)
         try:
             self.runWidgetThread = True
-            self.runCheckThread = time.monotonic()
+            self.runCheckThread = time.time()
 
             self.lastInferenceTime = 0.0
             self.threadExited = True
@@ -1590,7 +1634,7 @@ class NVRChannel(devices.Device):
                 "/dev/shm/knvr_buffer/"
                 + self.name
                 + "/"
-                + str(time.monotonic())
+                + str(time.time())
                 + ".raw_feed.tspipe"
             )
 
@@ -1655,14 +1699,15 @@ class NVRChannel(devices.Device):
                 "Camera dark",
                 "luma_average",
                 "value < 0.095",
-                trip_delay=3,
+                trip_delay=10,
                 auto_ack=True,
             )
             self.set_alarm(
                 "Camera low varience",
                 "luma_variance",
                 "value < 0.004",
-                trip_delay=3,
+                release_condition="value > 0.008",
+                trip_delay=60,
                 auto_ack=True,
             )
             self.set_alarm(
@@ -1751,8 +1796,8 @@ class NVRChannel(devices.Device):
             self.set_data_point("switch", 1)
 
             # Used to check that things are actually still working.
-            self.lastSegment = time.monotonic()
-            self.lastPushedWSData = time.monotonic()
+            self.lastSegment = time.time()
+            self.lastPushedWSData = time.time()
 
             self.check()
             self.checkthreadobj = threading.Thread(

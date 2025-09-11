@@ -23,7 +23,6 @@ setup(
     dependencies=[
         "opencv-python",
         "Pillow",
-        "cvlib",
         "icemedia",
         "scullery",
         "zeep",
