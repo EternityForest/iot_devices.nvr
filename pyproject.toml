@@ -1,6 +1,6 @@
 [project]
 name = "NVRChannel"
-version = "0.1.8"
+version = "0.2.0"
 requires-python = ">=3.10,<4.0"
 
 
@@ -13,11 +13,11 @@ classifiers = [
 
 dependencies = [
         "opencv-python",
+        "iot-devices >= 0.30.0",
         "Pillow",
         "icemedia",
         "scullery",
         "zeep",
-        "huggingface-hub",
 ]
 
 [build-system]
@@ -38,7 +38,7 @@ target-version = "py311"
 
 [tool.coverage.run]
 # omit the deprecated old file and system gstreamer
-omit = ["*/thirdparty/*", "*/selftest/*", "/usr/lib/**"]
+omit = ["*/thirdparty/*", "*/selftest/*", "/usr/lib/**","**/.mypy_cache"]
 sigterm = true
 
 [tool.coverage.report]
