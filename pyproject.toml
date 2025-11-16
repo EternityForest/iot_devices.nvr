@@ -1,6 +1,6 @@
 [project]
 name = "NVRChannel"
-version = "0.2.0"
+version = "0.20.0"
 requires-python = ">=3.10,<4.0"
 
 
